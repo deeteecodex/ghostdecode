@@ -1,0 +1,22 @@
+# environments
+venv/
+.venv/
+__pycache__/
+*.pyc
+
+# secrets - never commit API keys
+.env
+
+# decoder outputs and caches
+ghost_out*/
+agent_cache/
+vendor/
+build/
+dist/
+*.spec
+out*/
+*.npz
+
+# videos: never commit video files (third-party Ghost Font recordings, and
+# generated samples are big and can be rebuilt in under a minute).
+*.mp4
