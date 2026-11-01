@@ -13,9 +13,10 @@ Bring your own API key (nothing is stored or logged):
     $env:ANTHROPIC_API_KEY = "sk-..."
     python agent.py --provider anthropic --videos-dir path\\to\\videos
 
-Providers: anthropic, openai, gemini, grok, custom (any OpenAI-compatible
-endpoint via --base-url). Except for anthropic you must pass --model.
-If no key is found in the environment you are prompted (input hidden).
+Providers: anthropic, openai, gemini, grok, ollama (a local model: no key, no
+internet), custom (any OpenAI-compatible endpoint via --base-url). Except for
+anthropic you must pass --model. If no key is found in the environment you are
+prompted (input hidden).
 """
 import argparse
 import getpass
@@ -24,6 +25,7 @@ import json
 import os
 import re
 import sys
+from urllib.parse import urlparse
 
 import requests
 
@@ -42,6 +44,9 @@ PROVIDERS = {
                "env": ["GEMINI_API_KEY", "GOOGLE_API_KEY"], "model": None},
     "grok": {"kind": "openai", "url": "https://api.x.ai/v1/chat/completions",
              "env": ["XAI_API_KEY"], "model": None},
+    # Local model server (Ollama): no API key and no internet needed.
+    "ollama": {"kind": "openai", "url": "http://localhost:11434/v1/chat/completions",
+               "env": [], "model": None, "needs_key": False},
     "custom": {"kind": "openai", "url": None, "env": [], "model": None},
 }
 
@@ -97,9 +102,10 @@ class AgentError(Exception):
 
 # --------------------------------------------------------------------------- tools
 class Tools:
-    def __init__(self, videos_dir, cache_dir):
+    def __init__(self, videos_dir, cache_dir, progress=None):
         self.root = os.path.realpath(videos_dir)
         self.cache_dir = cache_dir
+        self._progress_cb = progress or self._stderr_progress
 
     def set_root(self, path):
         p = os.path.realpath(path)
@@ -107,7 +113,9 @@ class Tools:
             raise ToolError(f"not a folder: {path}")
         self.root = p
 
-    def _progress(self, stage, done, total):
+    def _stderr_progress(self, stage, done, total):
+        if sys.stderr is None:  # windowed app has no console
+            return
         if stage in ("motion", "reading"):
             print(f"\r    [{stage}] {done}/{total}   ", end="", file=sys.stderr, flush=True)
             if done == total:
@@ -144,7 +152,7 @@ class Tools:
         stem = re.sub(r"[^A-Za-z0-9]+", "_", os.path.splitext(os.path.basename(path))[0])[:40]
         tag = hashlib.sha1(path.encode()).hexdigest()[:6]
         out = os.path.join(self.cache_dir, f"{stem}_{tag}_w{winsize}")
-        res = decode(path, out, winsize=winsize, progress=self._progress)
+        res = decode(path, out, winsize=winsize, progress=self._progress_cb)
         win = res["windows"]
         want = text_key(res["text"] or "")
         matching = sum(1 for w in win if want and text_key(w["text"] or "") == want)
@@ -176,7 +184,9 @@ def _post(url, headers, body, secret):
     try:
         r = requests.post(url, headers=headers, json=body, timeout=180)
     except requests.RequestException as e:
-        raise AgentError(f"network error: {type(e).__name__}") from None
+        host = urlparse(url).netloc or "the server"
+        raise AgentError(f"couldn't reach {host} ({type(e).__name__}). "
+                         "Is the server running and the address right?") from None
     if r.status_code != 200:
         text = r.text[:500].replace(secret, "***") if secret else r.text[:500]
         raise AgentError(f"API returned {r.status_code}: {text}")
@@ -190,14 +200,20 @@ class OpenAICompat:
         self.url, self.key, self.model = url, key, model
         self.extra = extra or {}
         self.tools = [{"type": "function", "function": s} for s in specs]
+        self.system = system
         self.msgs = [{"role": "system", "content": system}]
+
+    def reset(self):
+        """Start a new conversation (keeps the connection)."""
+        self.msgs = [{"role": "system", "content": self.system}]
 
     def ask(self, user_text, on_tool):
         self.msgs.append({"role": "user", "content": user_text})
         for _ in range(MAX_STEPS):
             body = {"model": self.model, "messages": self.msgs, "tools": self.tools}
             body.update(self.extra)
-            data = _post(self.url, {"Authorization": f"Bearer {self.key}"}, body, self.key)
+            headers = {"Authorization": f"Bearer {self.key}"} if self.key else {}
+            data = _post(self.url, headers, body, self.key)
             self.reported_model = data.get("model")
             msg = data["choices"][0]["message"]
             calls = msg.get("tool_calls")
@@ -225,6 +241,10 @@ class AnthropicBackend:
                        "input_schema": s["parameters"]} for s in specs]
         self.msgs = []
 
+    def reset(self):
+        """Start a new conversation (keeps the connection)."""
+        self.msgs = []
+
     def ask(self, user_text, on_tool):
         self.msgs.append({"role": "user", "content": user_text})
         for _ in range(MAX_STEPS):
@@ -244,6 +264,59 @@ class AnthropicBackend:
                         "content": json.dumps(on_tool(c["name"], c["input"]))} for c in calls]
             self.msgs.append({"role": "user", "content": results})
         return "(stopped: too many tool steps)"
+
+
+# --------------------------------------------------------------------------- helpers
+def normalize_endpoint(url, kind="openai"):
+    """Turn a base URL such as http://localhost:11434/v1 into the full chat endpoint."""
+    url = (url or "").strip().rstrip("/")
+    if not url:
+        return url
+    if kind == "anthropic":
+        if url.endswith("/v1"):
+            url += "/messages"
+    elif not url.endswith("/chat/completions"):
+        url += "/chat/completions"
+    return url
+
+
+def is_local_url(url):
+    """True when the endpoint is on this computer, so nothing goes over the internet."""
+    return (urlparse(url or "").hostname or "").lower() in ("localhost", "127.0.0.1", "::1")
+
+
+def key_required(provider, url):
+    return PROVIDERS[provider].get("needs_key", True) and not is_local_url(url)
+
+
+def list_models(endpoint_url, timeout=5):
+    """Ask an OpenAI-compatible server (such as Ollama) which models it has installed."""
+    base = (endpoint_url or "").strip().rstrip("/")
+    if base.endswith("/chat/completions"):
+        base = base[: -len("/chat/completions")]
+    try:
+        r = requests.get(base + "/models", timeout=timeout)
+        r.raise_for_status()
+        return sorted(m["id"] for m in r.json().get("data", []))
+    except Exception:
+        return []
+
+
+def make_backend(provider, key, model, url=None, reasoning_effort=None):
+    """Build an LLM backend. The key lives only inside the returned object."""
+    cfg = PROVIDERS[provider]
+    url = normalize_endpoint(url or cfg["url"], cfg["kind"])
+    model = model or cfg["model"]
+    if not url:
+        raise AgentError("an endpoint URL is required")
+    if not model:
+        raise AgentError(f"a model name is required for {provider}")
+    if key_required(provider, url) and not key:
+        raise AgentError("an API key is required for this provider")
+    if cfg["kind"] == "anthropic":
+        return AnthropicBackend(url, key, model, TOOL_SPECS, SYSTEM_PROMPT)
+    extra = {"reasoning_effort": reasoning_effort} if reasoning_effort else None
+    return OpenAICompat(url, key, model, TOOL_SPECS, SYSTEM_PROMPT, extra=extra)
 
 
 # --------------------------------------------------------------------------- CLI
@@ -301,7 +374,8 @@ def main():
                     help="sent as reasoning_effort to OpenAI-style APIs (or set "
                          "LLM_REASONING_EFFORT); gpt-5.6-luna needs 'none' to use tools here")
     ap.add_argument("--base-url", default=os.environ.get("LLM_BASE_URL"),
-                    help="full chat endpoint URL (required for 'custom')")
+                    help="chat endpoint or base URL, e.g. http://localhost:11434/v1 "
+                         "(required for 'custom')")
     ap.add_argument("--videos-dir", default=os.environ.get("GHOST_VIDEOS_DIR"),
                     help="folder the agent may read videos from (or set GHOST_VIDEOS_DIR); "
                          "if unset you are asked at startup")
@@ -312,7 +386,7 @@ def main():
     if a.provider not in PROVIDERS:
         sys.exit(f"--provider must be one of {sorted(PROVIDERS)} (or set LLM_PROVIDER in .env)")
     cfg = PROVIDERS[a.provider]
-    url = a.base_url or cfg["url"]
+    url = normalize_endpoint(a.base_url or cfg["url"], cfg["kind"])
     model = a.model or cfg["model"]
     if not url:
         sys.exit("--base-url is required for the 'custom' provider")
@@ -331,13 +405,14 @@ def main():
         except (EOFError, KeyboardInterrupt):
             sys.exit()
 
-    key = get_key(cfg)
+    key = get_key(cfg) if key_required(a.provider, url) else ""
     tools = Tools(videos_dir, a.cache_dir)
-    cls = AnthropicBackend if cfg["kind"] == "anthropic" else OpenAICompat
-    kwargs = {}
-    if cfg["kind"] == "openai" and a.reasoning_effort:
-        kwargs["extra"] = {"reasoning_effort": a.reasoning_effort}
-    backend = cls(url, key, model, TOOL_SPECS, SYSTEM_PROMPT, **kwargs)
+    try:
+        backend = make_backend(a.provider, key, model, url, a.reasoning_effort)
+    except AgentError as e:
+        sys.exit(str(e))
+    if is_local_url(url):
+        print("Local endpoint: nothing leaves this computer.")
 
     def on_tool(name, args):
         show_tool_call(name, args)
