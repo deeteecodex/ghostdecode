@@ -42,6 +42,29 @@ DEFAULT_ENDPOINT = {pid: url for _, pid, url in PROVIDER_CHOICES}
 
 VIDEO_NAME_RE = re.compile(r"\.(mp4|mov|webm|avi|mkv|m4v)\b", re.IGNORECASE)
 
+
+def enable_dpi_awareness():
+    """Tell Windows this app handles scaled screens itself. Without this, Windows
+    draws it at normal size and stretches the picture, which makes text fuzzy."""
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+        try:
+            ctypes.windll.shcore.SetProcessDpiAwareness(1)   # system DPI aware
+        except (AttributeError, OSError):
+            ctypes.windll.user32.SetProcessDPIAware()
+    except Exception:
+        pass
+
+
+def ui_scale(root):
+    """How much bigger than the classic 96-dpi layout the screen is (1.0, 1.25, 1.5...)."""
+    try:
+        return max(1.0, root.winfo_fpixels("1i") / 96.0)
+    except tk.TclError:
+        return 1.0
+
 # ---------------------------------------------------------------- settings (never the key)
 SETTINGS_FIELDS = ("provider", "model", "endpoint", "reasoning_effort", "folder")
 
@@ -139,7 +162,7 @@ def error_hint(msg):
 
 # ---------------------------------------------------------------- Decode tab
 class DecodeTab:
-    def __init__(self, root, parent, on_video=None):
+    def __init__(self, root, parent, on_video=None, scale=1.0):
         self.root = root
         self.on_video = on_video
         self.q = queue.Queue()
@@ -150,7 +173,7 @@ class DecodeTab:
         frm.pack(fill="both", expand=True)
 
         ttk.Label(frm, text="Ghost Font decoder", font=("Segoe UI", 17, "bold")).pack(anchor="w")
-        ttk.Label(frm, wraplength=640, text=(
+        ttk.Label(frm, wraplength=int(640 * scale), text=(
             "Choose a Ghost Font video, or drag a video file onto GhostDecode.exe. "
             "This tab reads the hidden text from the motion and runs fully offline.")
         ).pack(anchor="w", pady=(2, 12))
@@ -257,7 +280,7 @@ class DecodeTab:
 
 # ---------------------------------------------------------------- Ask AI tab
 class AskTab:
-    def __init__(self, root, parent):
+    def __init__(self, root, parent, scale=1.0):
         self.root = root
         self.q = queue.Queue()
         self.backend = None          # holds the API key, in memory only
@@ -323,7 +346,7 @@ class AskTab:
         self.status = ttk.Label(btns, text="Not connected.")
         self.status.pack(side="left", padx=12)
 
-        self.privacy = ttk.Label(frm, text="", wraplength=700)
+        self.privacy = ttk.Label(frm, text="", wraplength=int(700 * scale))
         self.privacy.pack(anchor="w", pady=(6, 2))
 
         chat_frame = ttk.Frame(frm)
@@ -575,8 +598,11 @@ class App:
     def __init__(self, root):
         self.root = root
         root.title("GhostDecode")
-        root.geometry("780x760")
-        root.minsize(640, 600)
+        scale = ui_scale(root)
+        width = min(int(740 * scale), root.winfo_screenwidth() - 40)
+        height = min(int(680 * scale), root.winfo_screenheight() - 120)
+        root.geometry(f"{width}x{height}")
+        root.minsize(min(int(620 * scale), width), min(int(560 * scale), height))
         self.nb = ttk.Notebook(root)
         self.nb.pack(fill="both", expand=True)
         decode_frame = ttk.Frame(self.nb)
@@ -584,8 +610,8 @@ class App:
         self.nb.add(decode_frame, text="  Decode  ")
         self.nb.add(ask_frame, text="  Ask AI  ")
         self.decode_frame = decode_frame
-        self.ask = AskTab(root, ask_frame)
-        self.decode = DecodeTab(root, decode_frame, on_video=self.ask.suggest_folder)
+        self.ask = AskTab(root, ask_frame, scale)
+        self.decode = DecodeTab(root, decode_frame, on_video=self.ask.suggest_folder, scale=scale)
         root.protocol("WM_DELETE_WINDOW", self.close)
 
     def start(self, path):
@@ -598,6 +624,7 @@ class App:
 
 
 def main():
+    enable_dpi_awareness()
     root = tk.Tk()
     app = App(root)
     path = next((a for a in sys.argv[1:] if os.path.isfile(a)), None)
